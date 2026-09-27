@@ -24,12 +24,48 @@ use uuid::Uuid;
 mod signal;
 mod smf;
 
+/// One `--addr` argument: an address object name, optionally suffixed with
+/// `@server` or `@transit` to set that specific port's router kind.
+///
+/// Ports with no suffix fall back to the process-wide `--kind` default, so
+/// existing single-mode invocations (`--addr a --addr b --kind transit`)
+/// keep working unchanged. Mixing suffixes across `--addr` values lets one
+/// `ddmd` process serve intra-rack (server) ports and inter-rack (transit)
+/// ports at the same time, instead of needing a second process per kind.
+#[derive(Debug, Clone)]
+struct AddrSpec {
+    aobj_name: String,
+    kind: Option<RouterKind>,
+}
+
+impl std::str::FromStr for AddrSpec {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.split_once('@') {
+            Some((name, kind)) => Ok(AddrSpec {
+                aobj_name: name.to_string(),
+                kind: Some(kind.parse().map_err(|e: &str| {
+                    format!("invalid kind for address `{name}`: {e}")
+                })?),
+            }),
+            None => Ok(AddrSpec {
+                aobj_name: s.to_string(),
+                kind: None,
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None, styles = get_styles())]
 struct Arg {
-    /// Address objects to route over.
+    /// Address objects to route over, as `NAME` or `NAME@KIND` (KIND is
+    /// `server` or `transit`). Repeatable. An address with no `@KIND` uses
+    /// the `--kind` default. Mixing kinds lets a single ddmd instance cover
+    /// both intra-rack and inter-rack ports.
     #[arg(short, long = "addr", name = "addr")]
-    addresses: Vec<String>,
+    addresses: Vec<AddrSpec>,
 
     /// How long to wait between solicitations (milliseconds).
     #[arg(long, default_value_t = 2000)]
@@ -62,7 +98,8 @@ struct Arg {
     #[arg(long, default_value_t = 8000)]
     admin_port: u16,
 
-    /// Kind of router to run.
+    /// Default kind of router to run, used for any `--addr` that does not
+    /// specify its own `@server`/`@transit` suffix.
     #[arg(long, default_value_t = RouterKind::Server)]
     kind: RouterKind,
 
@@ -221,6 +258,10 @@ async fn run() {
 
 /// Build, wire, and start the per-address routing state machines.
 ///
+/// Each address gets its own router kind (see [`AddrSpec`]), so a single
+/// call can start a mix of server (intra-rack) and transit (inter-rack)
+/// state machines in one process.
+///
 /// Returns the running [`StateMachine`] handles plus the sender side of each
 /// machine's event channel. When `--api-only` is set the function
 /// short-circuits to empty vectors, leaving the daemon to serve only its
@@ -245,8 +286,15 @@ fn start_state_machines(
     let mut sms = Vec::new();
     let mut event_channels = Vec::new();
 
-    for name in &arg.addresses {
+    for spec in &arg.addresses {
         let (tx, rx) = channel();
+
+        // Each port gets its own kind: the one it was given via
+        // `--addr NAME@KIND`, or the process-wide `--kind` default if it
+        // didn't specify one. Previously every port silently got the same
+        // `arg.kind`, which is why running both server and transit ports
+        // required two separate ddmd processes.
+        let kind = spec.kind.unwrap_or(arg.kind);
 
         let config = ddm::sm::Config {
             solicit_interval: arg.solicit_interval,
@@ -255,10 +303,10 @@ fn start_state_machines(
             ip_addr_wait: arg.ip_addr_wait,
             exchange_timeout: arg.exchange_timeout,
             exchange_port: arg.exchange_port,
-            aobj_name: name.clone(),
+            aobj_name: spec.aobj_name.clone(),
             if_name: String::new(),
             if_index: 0,
-            kind: arg.kind,
+            kind,
             dpd: dpd.clone(),
             addr: Ipv6Addr::UNSPECIFIED,
         };
