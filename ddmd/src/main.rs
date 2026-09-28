@@ -24,8 +24,13 @@ use uuid::Uuid;
 mod signal;
 mod smf;
 
-/// A box created for storing a port's name and its mode, but the mode
-/// can also be empty.
+/// One `--addr` value: an address object name with an optional router kind,
+/// written `NAME` or `NAME@server` / `NAME@transit`.
+// The fields are only read by the illumos state-machine setup and the tests.
+#[cfg_attr(
+    not(all(feature = "backend", target_os = "illumos")),
+    allow(dead_code)
+)]
 #[derive(Debug, Clone)]
 struct AddrSpec {
     aobj_name: String,
@@ -35,30 +40,31 @@ struct AddrSpec {
 impl std::str::FromStr for AddrSpec {
     type Err = String;
 
-    /// Checks for `@`. The first half will be the port name and the second
-    /// half will be the mode. If no `@` is present, treat the entire text
-    /// as just the name.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.split_once('@') {
-            Some((name, kind)) => Ok(AddrSpec {
-                aobj_name: name.to_string(),
-                kind: Some(kind.parse().map_err(|e: &str| {
-                    format!("invalid kind for address `{name}`: {e}")
-                })?),
-            }),
-            None => Ok(AddrSpec {
-                aobj_name: s.to_string(),
-                kind: None,
-            }),
+        let (name, kind) = match s.split_once('@') {
+            Some((name, kind)) => (name, Some(kind)),
+            None => (s, None),
+        };
+        if name.is_empty() {
+            return Err(format!("empty address object name in `{s}`"));
         }
+        let kind = kind
+            .map(|k| {
+                k.parse().map_err(|e: &str| {
+                    format!("invalid kind for address `{name}`: {e}")
+                })
+            })
+            .transpose()?;
+        Ok(AddrSpec { aobj_name: name.to_string(), kind })
     }
 }
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None, styles = get_styles())]
 struct Arg {
-    /// A list of the labelled boxes from `AddrSpec` — each one now has an
-    /// optional mode instead of just a name.
+    /// Address objects to route over, each written `NAME` or
+    /// `NAME@server` / `NAME@transit`. A kind given here overrides `--kind`
+    /// for that address.
     #[arg(short, long = "addr", name = "addr")]
     addresses: Vec<AddrSpec>,
 
@@ -93,8 +99,8 @@ struct Arg {
     #[arg(long, default_value_t = 8000)]
     admin_port: u16,
 
-    /// The fallback mode used for any port that didn't specify its own
-    /// mode with `@server`/`@transit`.
+    /// Kind of router to run on addresses that don't specify their own with
+    /// `NAME@KIND`.
     #[arg(long, default_value_t = RouterKind::Server)]
     kind: RouterKind,
 
@@ -253,9 +259,8 @@ async fn run() {
 
 /// Build, wire, and start the per-address routing state machines.
 ///
-/// Each address now has its own mode, so the person can start a mix of
-/// server (intra-rack) and transit (inter-rack) state machines in a
-/// single process.
+/// Each address runs with its own kind, so a single process can mix server
+/// (intra-rack) and transit (inter-rack) state machines.
 ///
 /// Returns the running [`StateMachine`] handles plus the sender side of each
 /// machine's event channel. When `--api-only` is set the function
@@ -284,10 +289,8 @@ fn start_state_machines(
     for spec in &arg.addresses {
         let (tx, rx) = channel();
 
-        // Use this port's own mode if it has one; otherwise fall back to
-        // the overall default. Before, every port was given the same
-        // shared mode no matter what, which is why running both server
-        // and transit ports needed two separate ddmd processes.
+        // Use this address's own kind if it has one, otherwise the `--kind`
+        // default.
         let kind = spec.kind.unwrap_or(arg.kind);
 
         let config = ddm::sm::Config {
@@ -432,4 +435,35 @@ pub fn get_styles() -> clap::builder::Styles {
         .error(anstyle::Style::new().bold().fg_color(Some(
             anstyle::Color::Rgb(anstyle::RgbColor(232, 104, 134)),
         )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_only() {
+        let s: AddrSpec = "cxgbe0/ll".parse().unwrap();
+        assert_eq!(s.aobj_name, "cxgbe0/ll");
+        assert_eq!(s.kind, None);
+    }
+
+    #[test]
+    fn name_with_kind() {
+        let s: AddrSpec = "cxgbe0/ll@transit".parse().unwrap();
+        assert_eq!(s.aobj_name, "cxgbe0/ll");
+        assert_eq!(s.kind, Some(RouterKind::Transit));
+
+        let s: AddrSpec = "cxgbe1/ll@server".parse().unwrap();
+        assert_eq!(s.kind, Some(RouterKind::Server));
+    }
+
+    #[test]
+    fn rejects_bad_input() {
+        assert!("a@bogus".parse::<AddrSpec>().is_err());
+        assert!("a@".parse::<AddrSpec>().is_err());
+        assert!("@transit".parse::<AddrSpec>().is_err());
+        assert!("".parse::<AddrSpec>().is_err());
+        assert!("a@transit@server".parse::<AddrSpec>().is_err());
+    }
 }
